@@ -11,11 +11,13 @@ import "../cli/loadEnv.ts"; // MUST be first: load .env into process.env before 
 import readline from "node:readline/promises";
 import { stdin, stdout } from "node:process";
 import { OllamaClient } from "../model/ollamaClient.ts";
-import { createFullRegistry, ReadState, type ToolContext } from "../tools/tools.ts";
+import { createFullRegistry, powershellTool, ReadState, type ToolContext } from "../tools/tools.ts";
 import { createDefaultPermissions, type PermissionMode } from "../permissions/permissions.ts";
+import { loadPermissionRules, rememberAllowRule } from "../permissions/permissionsStore.ts";
 import { runAgent, type AgentEvent, type AskInfo } from "../agent/agent.ts";
 import { resolveModel, resolveWorkerModel, fileRegistryModels, getModels, OLLAMA_BASE_URL } from "../model/config.ts";
 import { preflight, formatPreflight } from "../cli/preflight.ts";
+import { interruptAction, shellGuidance, parseAskReply } from "../cli/repl.ts";
 import { Semaphore } from "../orchestration/gate.ts";
 import { runOrchestrator } from "../orchestration/orchestrator.ts";
 import { Session, listSessions } from "../state/session.ts";
@@ -23,14 +25,14 @@ import { rememberTool, recallTool, buildMemoryBlock } from "../state/memory.ts";
 import type { ChatMessage } from "../model/ollamaClient.ts";
 
 const SYSTEM_PROMPT = `You are a coding assistant working in a local project directory.
-You have tools: read_file, grep, write_file, edit_file, multi_edit, bash.
+You have tools: read_file, find_files, grep, write_file, edit_file, multi_edit, and a shell tool.
 
 How to work:
 - To inspect or change anything, CALL a tool — reading, searching, and editing happen only through tools.
-- To understand a project or directory, use bash to list and find files (\`ls\`, \`find\`), then read_file the key ones (README, package.json, files under src/), and grep to search the code.
+- To understand a project or directory, use your shell and find_files to list/find files, then read_file the key ones (README, package.json, files under src/), and grep to search the code.
 - Always read_file a file before you edit_file/multi_edit it; copy the text to change verbatim.
 - For several edits to one file in one step, prefer multi_edit (it applies atomically).
-- Use bash freely for shell + system tasks: list/find files (\`ls\`, \`find\`), search (\`grep -r\`), and inspect the machine (\`ps\`, \`du\`, \`git status\`, \`node -v\`). Safe read-only commands run without asking. Use read_file/edit_file/grep for the CONTENTS of specific files (they track reads so edits stay safe); use bash for everything else.`;
+- Use your shell freely for shell + system tasks (listing/finding files, searching, inspecting the machine). Safe read-only commands run without asking. Use read_file/edit_file/grep for the CONTENTS of specific files (they track reads so edits stay safe); use the shell for everything else.`;
 
 // Kept SEPARATE so it is always the LAST thing the model reads (recency matters for small models),
 // even when a memory block is inserted before it.
@@ -147,7 +149,11 @@ async function main(): Promise<void> {
   const registry = createFullRegistry()
     .register(rememberTool)
     .register(recallTool);
+  // Windows: add the PowerShell shell tool (the model is steered to it via the system prompt).
+  if (process.platform === "win32") registry.register(powershellTool);
   const permissions = createDefaultPermissions(args.mode);
+  // Grow the auto-allow set from this user's "always allow" history (persisted rules).
+  for (const r of loadPermissionRules()) permissions.addAllowRule(r);
   const ctx: ToolContext = { cwd: process.cwd(), readState: new ReadState() };
   let activeModel = model.name;
   // Worker model for multi-agent — REGISTRY-DRIVEN (works with any installed model, not hardcoded).
@@ -178,12 +184,22 @@ async function main(): Promise<void> {
   const rl = readline.createInterface({ input: stdin, output: stdout });
 
   const onAsk = async (info: AskInfo): Promise<boolean> => {
-    const ans = (
-      await rl.question(`\n⚠️  Allow ${info.toolName}(${JSON.stringify(info.args)})?  [${info.reason}]  (y/N) `)
-    )
-      .trim()
-      .toLowerCase();
-    return ans === "y" || ans === "yes";
+    const reply = parseAskReply(
+      await rl.question(
+        `\n⚠️  Allow ${info.toolName}(${JSON.stringify(info.args)})?  [${info.reason}]  (y = once · a = always · N = no) `,
+      ),
+    );
+    if (reply === "no") return false;
+    if (reply === "always") {
+      // "Always allow" remembers a shell COMMAND (prefix) — grows the auto-allow set without code edits.
+      const cmd = typeof info.args.command === "string" ? info.args.command.trim() : "";
+      if (cmd && (info.toolName === "bash" || info.toolName === "powershell")) {
+        permissions.addAllowRule({ tool: info.toolName, decision: "allow", commandPrefix: cmd, reason: "remembered (always allow)" });
+        rememberAllowRule(info.toolName, cmd);
+        console.log(`  (remembered — will auto-allow ${info.toolName} commands starting with "${cmd}")`);
+      }
+    }
+    return true;
   };
 
   // Shared 2-permit gate for multi-agent mode (orchestrator + workers).
@@ -191,16 +207,25 @@ async function main(): Promise<void> {
 
   // Tracks the in-flight request so Ctrl+C can abort it (and stop Ollama generating).
   let activeAbort: AbortController | null = null;
-  process.on("SIGINT", () => {
-    if (activeAbort) {
-      activeAbort.abort(); // a request is running → cancel it; the loop returns to the prompt
+  let exiting = false;
+  // Ctrl+C: cancel a running task (return to the prompt) or exit cleanly when idle.
+  // We MUST register this on `rl` too — without a "SIGINT" listener Node's readline
+  // closes the interface on Ctrl+C, which makes the next rl.question throw
+  // (ERR_USE_AFTER_CLOSE) and kills the REPL. `process` covers non-TTY/piped input.
+  const handleInterrupt = (): void => {
+    if (interruptAction(activeAbort !== null) === "cancel") {
+      activeAbort?.abort(); // a request is running → cancel it; the loop returns to the prompt
       console.log("\n(request cancelled)");
-    } else {
-      console.log("\n(bye)");
-      rl.close();
-      process.exit(0);
+      return;
     }
-  });
+    if (exiting) return; // one-shot: a single Ctrl+C exits once
+    exiting = true;
+    console.log("\n(bye)");
+    rl.close();
+    process.exit(0);
+  };
+  rl.on("SIGINT", handleInterrupt);
+  process.on("SIGINT", handleInterrupt);
 
   async function runTask(text: string): Promise<void> {
     const priorMessages = history.length > 0 ? history : undefined;
@@ -208,7 +233,7 @@ async function main(): Promise<void> {
     const compaction = { numCtx: resolveModel(activeModel).numCtx, threshold: 0.75, keepRecent: 8, toolResultCap: 2000 };
     const memBlock = buildMemoryBlock(text);
     const base = memBlock ? `${SYSTEM_PROMPT}\n\n${memBlock}` : SYSTEM_PROMPT;
-    const sysPrompt = `${base}\n\n${CRITICAL_RULES}`; // critical rules LAST (recency for small models)
+    const sysPrompt = `${base}\n\n${shellGuidance(process.platform)}\n\n${CRITICAL_RULES}`; // critical rules LAST (recency for small models)
     const ac = new AbortController();
     activeAbort = ac;
     try {
@@ -269,7 +294,7 @@ async function main(): Promise<void> {
   const modeLabel = args.multi ? `multi-agent (orch=${activeModel}, worker=${workerModel}, cap=2)` : `single (${activeModel})`;
   console.log(`qwen-harness  —  ${modeLabel}  |  perms: ${permissions.mode}  |  cwd: ${ctx.cwd}`);
   console.log(`session: ${session.id}   (resume later:  npm start -- --resume ${session.id})`);
-  console.log(`commands: /exit  /model <tag>  /mode <mode>  /models  /sessions  /new\n`);
+  console.log(`commands: /exit  /model <tag>  /mode <mode>  /models  /perms  /sessions  /new\n`);
   for (;;) {
     let input: string;
     try {
@@ -281,6 +306,12 @@ async function main(): Promise<void> {
     }
     if (!input) continue;
     if (input === "/exit" || input === "/quit") break;
+    if (input === "/perms") {
+      const rules = loadPermissionRules();
+      if (rules.length === 0) console.log("no remembered 'always allow' rules yet (press 'a' at a permission prompt to add one).");
+      else for (const r of rules) console.log(`  ${r.tool}: ${r.commandPrefix}`);
+      continue;
+    }
     if (input === "/models") {
       console.log(`configured: ${Object.keys(getModels()).join(", ")}`);
       try {
@@ -318,7 +349,7 @@ async function main(): Promise<void> {
       continue;
     }
     if (input.startsWith("/")) {
-      console.log(`unknown command "${input.split(" ")[0]}". commands: /exit  /model <tag>  /mode <mode>  /models  /sessions  /new`);
+      console.log(`unknown command "${input.split(" ")[0]}". commands: /exit  /model <tag>  /mode <mode>  /models  /perms  /sessions  /new`);
       continue;
     }
     try {

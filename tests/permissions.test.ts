@@ -8,6 +8,7 @@ import {
   dangerousCommandRule,
   requestFromTool,
   isReadOnlyBashCommand,
+  isReadOnlyPowerShellCommand,
   DANGEROUS_COMMAND_PATTERNS,
   type PermissionRequest,
 } from "../src/permissions/permissions.ts";
@@ -104,6 +105,54 @@ test("the hardened deny floor catches more destructive forms (and spares safe va
   for (const command of ["chmod -R 755 .", "chmod 644 a.txt", "chown -R user /home/u/app", "crontab -l", "shred.txt"]) {
     assert.equal(rule.when?.({ command }), false, command);
   }
+});
+
+test("isReadOnlyPowerShellCommand: read-only cmdlet pipelines allow, everything else asks", () => {
+  for (const c of [
+    "Get-Process",
+    "gps",
+    "Get-ChildItem -Recurse",
+    "Get-Content a.txt",
+    "Get-Process | Sort-Object CPU -Descending | Select-Object -First 10",
+    "Get-CimInstance Win32_Process | Select-Object Name, Id",
+  ]) {
+    assert.equal(isReadOnlyPowerShellCommand(c), true, c);
+  }
+  for (const c of [
+    "",
+    "Remove-Item x",
+    "iex (Get-Content x)",
+    "Get-Process | Where-Object {$_.CPU -gt 10}", // script block
+    "Get-Content a; Remove-Item b", // chaining
+    "Start-Process -Verb RunAs notepad",
+    "echo $env:SECRET", // variable
+    "Get-Process > out.txt", // redirect
+  ]) {
+    assert.equal(isReadOnlyPowerShellCommand(c), false, JSON.stringify(c));
+  }
+});
+
+test("powershell auto-allows safe cmdlets; deny floor still blocks Remove-Item -Recurse -Force", () => {
+  const p = createDefaultPermissions("default");
+  assert.equal(
+    p.decide(mut("powershell", { command: "Get-Process | Sort-Object CPU -Descending | Select-Object -First 10" })).decision,
+    "allow",
+  );
+  assert.equal(p.decide(mut("powershell", { command: "Get-Content app.config" })).decision, "allow");
+  assert.equal(p.decide(mut("powershell", { command: "Remove-Item x" })).decision, "ask"); // not read-only → ask
+  assert.equal(p.decide(mut("powershell", { command: "Remove-Item . -Recurse -Force" })).decision, "deny"); // deny floor
+});
+
+test("addAllowRule + commandPrefix: remembered command auto-allows (word-boundary); deny floor still wins", () => {
+  const p = createDefaultPermissions("default");
+  p.addAllowRule({ tool: "bash", decision: "allow", commandPrefix: "npm test" });
+  assert.equal(p.decide(mut("bash", { command: "npm test" })).decision, "allow"); // exact
+  assert.equal(p.decide(mut("bash", { command: "npm test --watch" })).decision, "allow"); // prefix + space
+  assert.equal(p.decide(mut("bash", { command: "npm test-runner" })).decision, "ask"); // NOT a substring match
+  assert.equal(p.decide(mut("bash", { command: "npm run build" })).decision, "ask"); // different command
+  // a remembered allow can NEVER override the dangerous-command deny floor (deny is checked first)
+  p.addAllowRule({ tool: "bash", decision: "allow", commandPrefix: "rm -rf /" });
+  assert.equal(p.decide(mut("bash", { command: "rm -rf /" })).decision, "deny");
 });
 
 // ---------------- explicit rules ----------------

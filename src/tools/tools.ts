@@ -10,7 +10,7 @@
 
 import fs from "node:fs/promises";
 import path from "node:path";
-import { exec } from "node:child_process";
+import { exec, execFile } from "node:child_process";
 import type { ToolDef } from "../model/ollamaClient.ts";
 
 /**
@@ -599,30 +599,62 @@ export const multiEditTool: Tool = {
   },
 };
 
-// ----------------------------- bash -----------------------------
+// ----------------------------- bash / powershell -----------------------------
 
-const BASH_OUTPUT_CAP = 30000;
+const SHELL_OUTPUT_CAP = 30000;
 
-function runShell(
-  command: string,
-  cwd: string,
-  timeoutMs: number,
-): Promise<{ stdout: string; stderr: string; code: number; timedOut: boolean }> {
+interface ExecResult {
+  stdout: string;
+  stderr: string;
+  code: number;
+  timedOut: boolean;
+}
+
+// Shared shaping for exec/execFile callbacks (reused by bash + powershell).
+function shapeExecResult(err: unknown, stdout: string, stderr: string): ExecResult {
+  const e = err as (Error & { code?: number; killed?: boolean }) | null;
+  return {
+    stdout: stdout ?? "",
+    stderr: stderr ?? "",
+    code: e && typeof e.code === "number" ? e.code : e ? 1 : 0,
+    timedOut: Boolean(e?.killed),
+  };
+}
+
+function runShell(command: string, cwd: string, timeoutMs: number): Promise<ExecResult> {
   return new Promise((resolve) => {
     exec(
       command,
       { cwd, timeout: timeoutMs, maxBuffer: 10 * 1024 * 1024, windowsHide: true },
-      (err, stdout, stderr) => {
-        const e = err as (Error & { code?: number; killed?: boolean }) | null;
-        resolve({
-          stdout: stdout ?? "",
-          stderr: stderr ?? "",
-          code: e && typeof e.code === "number" ? e.code : e ? 1 : 0,
-          timedOut: Boolean(e?.killed),
-        });
-      },
+      (err, stdout, stderr) => resolve(shapeExecResult(err, stdout, stderr)),
     );
   });
+}
+
+// Run a PowerShell command directly (arg array → no intermediate shell-quoting). powershell.exe (5.1)
+// ships with Windows; pwsh (7+) is the cross-platform binary used off-Windows.
+const POWERSHELL_BIN = process.platform === "win32" ? "powershell.exe" : "pwsh";
+
+function runPowerShell(command: string, cwd: string, timeoutMs: number): Promise<ExecResult> {
+  return new Promise((resolve) => {
+    execFile(
+      POWERSHELL_BIN,
+      ["-NoProfile", "-NonInteractive", "-Command", command],
+      { cwd, timeout: timeoutMs, maxBuffer: 10 * 1024 * 1024, windowsHide: true },
+      (err, stdout, stderr) => resolve(shapeExecResult(err, stdout, stderr)),
+    );
+  });
+}
+
+function formatShellOutput(r: ExecResult, timeoutMs: number): string {
+  let out = r.stdout;
+  if (r.stderr.trim()) out += `${out ? "\n" : ""}[stderr]\n${r.stderr}`;
+  out = out.trim();
+  if (out.length > SHELL_OUTPUT_CAP) {
+    out = out.slice(0, SHELL_OUTPUT_CAP) + `\n... (output truncated at ${SHELL_OUTPUT_CAP} chars)`;
+  }
+  const head = r.timedOut ? `timed out after ${timeoutMs}ms; ` : "";
+  return `${head}exit code: ${r.code}\n${out || "(no output)"}`;
 }
 
 export const bashTool: Tool = {
@@ -643,15 +675,32 @@ export const bashTool: Tool = {
     const command = asString(args.command);
     if (!command) return "Error: 'command' is required.";
     const timeoutMs = Math.max(1000, asInt(args.timeout) ?? 30000);
-    const { stdout, stderr, code, timedOut } = await runShell(command, ctx.cwd, timeoutMs);
-    let out = stdout;
-    if (stderr.trim()) out += `${out ? "\n" : ""}[stderr]\n${stderr}`;
-    out = out.trim();
-    if (out.length > BASH_OUTPUT_CAP) {
-      out = out.slice(0, BASH_OUTPUT_CAP) + `\n... (output truncated at ${BASH_OUTPUT_CAP} chars)`;
-    }
-    const head = timedOut ? `timed out after ${timeoutMs}ms; ` : "";
-    return `${head}exit code: ${code}\n${out || "(no output)"}`;
+    return formatShellOutput(await runShell(command, ctx.cwd, timeoutMs), timeoutMs);
+  },
+};
+
+export const powershellTool: Tool = {
+  name: "powershell",
+  description:
+    "Run a PowerShell command (Windows) and return its output. Write PowerShell cmdlets — e.g. " +
+    "Get-Process, Get-ChildItem, Get-Content, Select-String, Get-Counter. For top CPU use " +
+    "`Get-Process | Sort-Object CPU -Descending | Select-Object -First 10`. NOT for reading/editing " +
+    "files (use read_file/edit_file).",
+  readOnly: false,
+  parameters: {
+    type: "object",
+    properties: {
+      command: { type: "string", description: "The PowerShell command to run." },
+      timeout: { type: "number", description: "Timeout in milliseconds (default 30000)." },
+    },
+    required: ["command"],
+    additionalProperties: false,
+  },
+  async execute(args, ctx) {
+    const command = asString(args.command);
+    if (!command) return "Error: 'command' is required.";
+    const timeoutMs = Math.max(1000, asInt(args.timeout) ?? 30000);
+    return formatShellOutput(await runPowerShell(command, ctx.cwd, timeoutMs), timeoutMs);
   },
 };
 

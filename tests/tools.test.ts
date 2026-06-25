@@ -14,6 +14,7 @@ import {
   findFilesTool,
   patternToRegExp,
   FIND_FILES_MAX_RESULTS,
+  powershellTool,
   type ToolContext,
 } from "../src/tools/tools.ts";
 
@@ -180,6 +181,19 @@ test("patternToRegExp: segment-aware glob → regex (no extglob)", () => {
   assert.ok(patternToRegExp("{a,b}.txt").test("b.txt"));
   assert.ok(!patternToRegExp("{a,b}.txt").test("c.txt"));
   assert.ok(patternToRegExp("[ab].txt").test("a.txt"));
+});
+
+// ---------------- powershell ----------------
+test("powershell tool metadata: command required, not read-only", () => {
+  assert.equal(powershellTool.name, "powershell");
+  assert.equal(powershellTool.readOnly, false);
+  const params = powershellTool.parameters as { required?: string[] };
+  assert.ok((params.required ?? []).includes("command"));
+});
+
+test("powershell executes a read-only command (Windows only)", { skip: process.platform !== "win32" }, async () => {
+  const out = await powershellTool.execute({ command: "Get-Location | Select-Object -ExpandProperty Path" }, ctx);
+  assert.match(out, /exit code: 0/);
 });
 
 test("registry.dispatch runs a real tool end-to-end", async () => {

@@ -32,7 +32,9 @@ thinks with your local AI, and **never sends a single byte to the internet**.
 - **Edit files carefully** — "Correct the typo in `readme.txt`." It can also make
   several edits to one file in a single all-or-nothing step (the `multi_edit` tool),
   so the file is never left half-changed.
-- **Run commands** — "Run the tests and tell me whether they pass."
+- **Run commands** — "Run the tests and tell me whether they pass." On **Windows** it uses **PowerShell**
+  (e.g. `Get-Process` for processes, `Get-ChildItem` to list); on **macOS/Linux** it uses **bash** (`ps`,
+  `ls`, …). Safe read-only commands run without asking; anything else asks first.
 - **Check your setup** — "Which models do I have installed?" (it can list your local models).
 - **Explore a project** — "Read this project and tell me what it does." It uses `find_files` (e.g. `**/*.ts`) and bash to list/find files, then reads the key ones. For a big whole-project job,
   give it more steps: `npm start -- --max-turns 40 "..."`.
@@ -254,11 +256,15 @@ the prompt. To leave, type `/exit` (or press Ctrl+C at an empty prompt, or Ctrl+
 ## 6. Staying in control: permission prompts
 
 The assistant is deliberately cautious. Before anything that **changes a file or
-runs a command**, it pauses and asks:
+runs a command** that isn't already trusted, it pauses and asks:
 ```
-⚠️  Allow write_file({"path":"todo.txt",...})?  [mutating tool requires confirmation]  (y/N)
+⚠️  Allow bash({"command":"npm test"})?  [mutating tool requires confirmation]  (y = once · a = always · N = no)
 ```
-- Type **`y`** and Enter to allow it.
+- Type **`y`** to allow it **once**.
+- Type **`a`** to **always allow** that command — it's remembered (saved under `~/.qwen-harness/`), so the
+  same command (and commands starting with it) run **without asking** next time, even after a restart. This
+  is how the "runs without asking" set grows over time — you never have to pre-list commands. (See your
+  remembered ones any time with **`/perms`**.)
 - Type **`n`** (or just press Enter) to decline.
 
 A small set of **clearly destructive commands** — for instance, anything that would

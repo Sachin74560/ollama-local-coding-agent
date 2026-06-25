@@ -32,6 +32,8 @@ export interface PermissionRule {
   /** exact tool name, or "*" for any tool */
   tool: string;
   decision: PermissionDecision;
+  /** match only when `args.command` equals this OR starts with `prefix + " "` (word-boundary prefix). */
+  commandPrefix?: string;
   /** optional finer match on the call's arguments */
   when?: (args: Record<string, unknown>) => boolean;
   reason?: string;
@@ -46,6 +48,10 @@ export interface PermissionConfig {
 
 function ruleMatches(rule: PermissionRule, req: PermissionRequest): boolean {
   if (rule.tool !== "*" && rule.tool !== req.toolName) return false;
+  if (rule.commandPrefix !== undefined) {
+    const cmd = typeof req.args.command === "string" ? req.args.command.trim() : "";
+    if (cmd !== rule.commandPrefix && !cmd.startsWith(rule.commandPrefix + " ")) return false;
+  }
   if (rule.when && !rule.when(req.args)) return false;
   return true;
 }
@@ -171,6 +177,48 @@ export function isReadOnlyBashCommand(command: string): boolean {
   return READONLY_COMMANDS.has(head);
 }
 
+// ---- safe read-only PowerShell classification (the `powershell` tool's auto-allow) ----
+// Unlike bash we ALLOW `|` (PowerShell is pipe-centric), but reject any arbitrary-code / chaining /
+// redirect / variable / script-block character, and require every pipeline segment to start with a
+// read-only cmdlet/alias. Anything else (script block `{…}`, `$(…)`, `iex`, `Remove-Item`, …) → false → "ask".
+const PS_DANGER = /[;&$`{}<>]/;
+
+const PS_READONLY_CMDLETS = new Set([
+  "get-process", "get-childitem", "get-content", "get-item", "get-itemproperty", "get-location",
+  "get-date", "get-command", "get-help", "get-member", "get-counter", "get-ciminstance",
+  "get-computerinfo", "get-service", "get-history", "get-variable", "get-module", "test-path",
+  "resolve-path", "select-string", "measure-object", "sort-object", "select-object", "where-object",
+  "format-table", "format-list", "out-string", "convertto-json", "convertto-csv", "write-output", "echo",
+]);
+
+const PS_ALIASES: Record<string, string> = {
+  ls: "get-childitem", dir: "get-childitem", gci: "get-childitem",
+  cat: "get-content", gc: "get-content", type: "get-content",
+  gps: "get-process", ps: "get-process",
+  pwd: "get-location", gl: "get-location",
+  gi: "get-item", gm: "get-member", gcm: "get-command",
+  select: "select-object", sort: "sort-object", measure: "measure-object",
+  "?": "where-object", where: "where-object",
+  ft: "format-table", fl: "format-list", sls: "select-string",
+};
+
+/**
+ * True only for PowerShell commands we are confident are read-only (safe to run without asking):
+ * a `|`-pipeline whose every segment starts with a read-only cmdlet/alias and which contains no
+ * arbitrary-code construct (script block, sub-expression, variable, call operator, chaining, redirect).
+ */
+export function isReadOnlyPowerShellCommand(command: string): boolean {
+  const cmd = command.trim();
+  if (!cmd) return false;
+  if (PS_DANGER.test(cmd)) return false;
+  for (const seg of cmd.split("|")) {
+    const head = seg.trim().split(/\s+/)[0]?.toLowerCase();
+    if (!head) return false;
+    if (!PS_READONLY_CMDLETS.has(PS_ALIASES[head] ?? head)) return false;
+  }
+  return true;
+}
+
 export class PermissionEngine {
   private cfg: PermissionConfig;
 
@@ -183,6 +231,10 @@ export class PermissionEngine {
   }
   setMode(m: PermissionMode): void {
     this.cfg.mode = m;
+  }
+  /** Add an allow rule at runtime (used by "always allow this command"). */
+  addAllowRule(rule: PermissionRule): void {
+    this.cfg.allow.push(rule);
   }
 
   decide(req: PermissionRequest): PermissionResult {
@@ -216,6 +268,13 @@ export class PermissionEngine {
       req.toolName === "bash" &&
       !req.readOnly &&
       isReadOnlyBashCommand(typeof req.args.command === "string" ? req.args.command : "")
+    ) {
+      return { decision: "allow", reason: "read-only shell command" };
+    }
+    if (
+      req.toolName === "powershell" &&
+      !req.readOnly &&
+      isReadOnlyPowerShellCommand(typeof req.args.command === "string" ? req.args.command : "")
     ) {
       return { decision: "allow", reason: "read-only shell command" };
     }

@@ -300,14 +300,28 @@ The built-in block for the most destructive commands stays on in every mode — 
 safety net, not a guarantee. For real isolation (especially with `acceptEdits` / `bypass`), run the
 tool **contained**.
 
-**Running contained (optional, stronger isolation).** The surest way to keep the agent off the rest of
-your machine is to run the whole tool inside a container or VM:
-- **Docker / WSL2 (any OS):** run `npm start` inside a container or a WSL2 shell whose only writable
-  mount is your project folder. This is the most portable real isolation — and it works on Windows too.
+**Running contained (the real safety guarantee).** No command allow/deny list can be perfect — the durable
+way to keep the agent off the rest of your machine is to run the whole tool inside a container, so even an
+**unknown** destructive command can only touch the project you mount. **Recommended whenever you use
+`acceptEdits` / `bypass`.**
+- **Docker (any OS) — recommended:** a ready `Dockerfile` ships with the tool. Build once, then run with
+  ONLY your project mounted writable:
+  ```
+  docker build -t qwen-harness .
+  docker run --rm -it -v "$PWD:/work" -w /work \
+    -e OLLAMA_BASE_URL=http://host.docker.internal:11434 \
+    --add-host host.docker.internal:host-gateway \
+    qwen-harness --mode acceptEdits "your task"
+  ```
+  Inside the container even `rm -rf` can only touch your mounted project — never your host. This is also
+  the real defense against prompt-injection: a malicious file can't make the agent escape the container.
+- **WSL2 (Windows):** run inside a WSL2 shell scoped to your project for the same effect.
 - **A sandbox wrapper (Linux/macOS):** set `QWEN_HARNESS_SANDBOX` to a sandbox command and every shell
-  command the agent runs is launched inside it — e.g.
-  `QWEN_HARNESS_SANDBOX="bwrap --ro-bind / / --bind . . --unshare-net"` (Linux, bubblewrap), or a
-  `sandbox-exec -f profile.sb` profile (macOS). Leave it unset for the normal behavior.
+  command runs inside it — e.g. `QWEN_HARNESS_SANDBOX="bwrap --ro-bind / / --bind . . --unshare-net"`
+  (bubblewrap) or a `sandbox-exec -f profile.sb` profile (macOS). Unset = normal behavior.
+
+**Project conventions.** Drop an `AGENTS.md` or `.qwen-harness.md` in your project with rules (e.g. "answer
+in French", "use tabs, not spaces") and the tool loads them into every prompt for that project.
 
 ---
 

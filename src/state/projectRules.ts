@@ -11,6 +11,19 @@ import path from "node:path";
 const PROJECT_RULE_FILES = [".qwen-harness.md", "AGENTS.md", ".qwenrules"];
 const PROJECT_RULES_CAP = 16_000; // keep the prompt bounded
 
+/** The first present, NON-EMPTY project-rules file under `cwd` (its name), or null. Mirrors loadProjectRules's
+ * selection — so a workspace-trust prompt fires only when there is actually something to gate. */
+export function findProjectRulesFile(cwd: string): string | null {
+  for (const name of PROJECT_RULE_FILES) {
+    try {
+      if (fs.readFileSync(path.join(cwd, name), "utf8").trim()) return name;
+    } catch {
+      continue; // not present / unreadable / empty → try the next candidate
+    }
+  }
+  return null;
+}
+
 /** Read the first present project-rules file under `cwd`, as a prompt block (or "" if none/unreadable). */
 export function loadProjectRules(cwd: string): string {
   for (const name of PROJECT_RULE_FILES) {

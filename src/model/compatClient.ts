@@ -12,6 +12,7 @@ import { resolveModel } from "./config.ts";
 import { type RetryConfig, RETRY_DEFAULTS, retryWithBackoff } from "./retry.ts";
 import type { ModelClient } from "./modelClient.ts";
 import type { ChatMessage, ChatOptions, ChatResult, ToolCall } from "./ollamaClient.ts";
+import { looseParseObject } from "./jsonRepair.ts";
 
 /** Map our neutral ChatMessage to the /v1 wire shape (assistant tool_calls + tool tool_call_id are required). */
 function toWireMessage(m: ChatMessage): Record<string, unknown> {
@@ -41,12 +42,8 @@ function fromWireToolCall(tc: unknown): ToolCall | null {
   let args: Record<string, unknown> = {};
   const rawArgs = fn.arguments;
   if (typeof rawArgs === "string") {
-    try {
-      const v = JSON.parse(rawArgs);
-      if (v && typeof v === "object" && !Array.isArray(v)) args = v as Record<string, unknown>;
-    } catch {
-      /* leave {} — arg repair lives in the agent loop */
-    }
+    const parsed = looseParseObject(rawArgs); // /v1 sends arguments as a string; repair near-miss JSON, else leave {}
+    if (parsed) args = parsed;
   } else if (rawArgs && typeof rawArgs === "object" && !Array.isArray(rawArgs)) {
     args = rawArgs as Record<string, unknown>;
   }

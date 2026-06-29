@@ -9,6 +9,7 @@ import {
   requestFromTool,
   isReadOnlyBashCommand,
   isReadOnlyPowerShellCommand,
+  looksLikeCredentialPath,
   DANGEROUS_COMMAND_PATTERNS,
   type PermissionRequest,
 } from "../src/permissions/permissions.ts";
@@ -399,4 +400,32 @@ test("isReadOnlyBashCommand: reject matrix (operators, write-flags, non-allowlis
   ]) {
     assert.equal(isReadOnlyBashCommand(c), false, JSON.stringify(c));
   }
+});
+
+// ---------------- Help005: sensitive-path read guard ----------------
+test("looksLikeCredentialPath flags credential reads, not normal files or .env.example", () => {
+  const rf = (p: string): PermissionRequest => ({ toolName: "read_file", args: { path: p }, readOnly: true });
+  const sh = (c: string): PermissionRequest => ({ toolName: "bash", args: { command: c }, readOnly: false });
+  for (const r of [
+    rf("/home/u/.ssh/id_rsa"),
+    rf(".env"),
+    rf("config/.env.local"),
+    rf("certs/server.pem"),
+    rf("/home/u/.aws/credentials"),
+    rf(".npmrc"),
+    sh("cat ~/.ssh/id_rsa"),
+  ]) {
+    assert.ok(looksLikeCredentialPath(r), JSON.stringify(r.args));
+  }
+  for (const r of [rf(".env.example"), rf("src/index.ts"), rf("README.md"), sh("ls -la"), sh("grep foo src")]) {
+    assert.ok(!looksLikeCredentialPath(r), JSON.stringify(r.args));
+  }
+});
+
+test("Help005: decide() asks before a credential read, still auto-allows normal reads", () => {
+  const p = createDefaultPermissions("default");
+  assert.equal(p.decide({ toolName: "read_file", args: { path: "/home/u/.ssh/id_rsa" }, readOnly: true }).decision, "ask");
+  assert.equal(p.decide({ toolName: "bash", args: { command: "cat ~/.ssh/id_rsa" }, readOnly: false }).decision, "ask");
+  assert.equal(p.decide({ toolName: "read_file", args: { path: "src/foo.ts" }, readOnly: true }).decision, "allow");
+  assert.equal(p.decide({ toolName: "read_file", args: { path: ".env.example" }, readOnly: true }).decision, "allow");
 });

@@ -29,6 +29,7 @@ export type AgentEvent =
   | { type: "assistant"; text: string; toolCalls: ToolCall[]; turn: number }
   | { type: "tool_result"; tool: string; decision: PermissionDecision; content: string; turn: number }
   | { type: "compaction"; summarized: number; truncatedChars?: number; turn: number }
+  | { type: "reflection"; reason: "tool_error" | "repeated_denial"; turn: number }
   | { type: "done"; reason: string; turns: number };
 
 export interface RunAgentOptions {
@@ -46,6 +47,8 @@ export interface RunAgentOptions {
   onAsk?: AskHandler;
   /** observer for logging / streaming UI */
   onEvent?: (ev: AgentEvent) => void;
+  /** triggered self-reflection after a detected problem (tool error / repeated denial); default: true */
+  reflect?: boolean;
   /** optional concurrency gate; if set, each generation acquires one permit */
   gate?: Semaphore;
   /** stream tokens as they arrive (uses client.chatStream + onToken) */
@@ -82,8 +85,12 @@ const NARRATION_RE =
 const NARRATION_NUDGE =
   'Do not describe the action or ask me to do it — emit the tool call yourself now, as JSON: {"name":"read_file","arguments":{"path":"<path>"}}. If the task is already done, give your 1-2 sentence final answer.';
 const MAX_CONSECUTIVE_REPEATS = 2; // the 3rd identical tool-call turn in a row = a stuck loop -> stop
+const MAX_REPAIR_ATTEMPTS = 3; // per-tool malformed-args budget: after this many, stop re-prompting that tool
 const LOOP_WARNING =
   "You've repeated the same action without making progress. Try a different approach, or give your final answer.";
+const MAX_REFLECTIONS_PER_RUN = 1; // at most one triggered self-check per run (cost-bounded; never per-turn)
+const REFLECTION_PROMPT =
+  "The last step hit a problem (a tool error or a blocked action). Briefly check: was the tool name and arguments right, or should you try a different tool or approach? Then take the corrected action, or give your final answer.";
 
 // How a resolved tool call moves the denial circuit-breaker counter.
 type DenialEffect = "reset" | "increment" | "none";
@@ -121,6 +128,8 @@ export async function runAgent(opts: RunAgentOptions): Promise<AgentResult> {
   let consecutiveNudges = 0;
   let consecutiveRepeats = 0;
   let lastToolFingerprint = "";
+  const perToolRepairAttempts = new Map<string, number>(); // tool name -> consecutive malformed-args attempts
+  let reflectionsUsed = 0; // Help006: bounded triggered self-reflection
 
   for (let turn = 1; turn <= maxTurns; turn++) {
     // Stop before spending a generation if the run was aborted (Ctrl+C / exit).
@@ -212,18 +221,25 @@ export async function runAgent(opts: RunAgentOptions): Promise<AgentResult> {
     // consecutiveDenials — it returns the effect, so single- and multi-call paths match.
     const resolveOne = async (call: ToolCall): Promise<ResolvedToolCall> => {
       const name = call.function.name;
-      const args = call.function.arguments ?? {};
+      let args = call.function.arguments ?? {};
       const tool = opts.registry.get(name);
       const base = { id: call.id, name, args, readOnly: false, needsDispatch: false };
       if (!tool) {
         const content = `Error: unknown tool "${name}". Available: ${opts.registry.list().map((t) => t.name).join(", ")}.`;
         return { ...base, decision: "deny", content, effect: "none" };
       }
+      args = coerceArgs(tool.parameters, args); // Help007: repair a stringified number/bool before validating
       const v = validateArgs(tool.parameters, args);
       if (!v.ok) {
-        const content = `Error: invalid arguments for ${name}: ${v.errors.join("; ")}. Call it again with corrected arguments.`;
-        return { ...base, decision: "deny", content, effect: "none" };
+        const attempts = (perToolRepairAttempts.get(name) ?? 0) + 1;
+        perToolRepairAttempts.set(name, attempts);
+        const why = `invalid arguments for ${name}: ${v.errors.join("; ")}`;
+        if (attempts >= MAX_REPAIR_ATTEMPTS) {
+          return { ...base, args, decision: "deny", effect: "increment", content: `Error: ${why}. Giving up on ${name} after ${attempts} malformed attempts — try a different approach.` };
+        }
+        return { ...base, args, decision: "deny", effect: "none", content: `Error: ${why}. Call it again with corrected arguments.` };
       }
+      perToolRepairAttempts.delete(name); // valid call -> reset this tool's repair budget
       const verdict = opts.permissions.decide(requestFromTool(tool, args));
       if (verdict.decision === "allow") {
         return { id: call.id, name, args, readOnly: tool.readOnly, decision: "allow", needsDispatch: true, content: "", effect: "reset" };
@@ -243,13 +259,15 @@ export async function runAgent(opts: RunAgentOptions): Promise<AgentResult> {
       else if (e === "increment") consecutiveDenials++;
     };
 
+    let sawToolFailure = false; // Help006: did this turn end in a tool crash / unknown-tool?
     if (toolCalls.length === 1) {
       // Fast path: identical to the original sequential behavior (no Promise.all overhead).
       const r = await resolveOne(toolCalls[0]);
       applyEffect(r.effect);
       if (r.needsDispatch) r.content = await opts.registry.dispatch(r.name, r.args, opts.ctx);
-      record({ role: "tool", content: r.content, tool_name: r.name, tool_call_id: r.id });
+      record({ role: "tool", content: r.decision === "allow" ? wrapToolOutput(r.content) : r.content, tool_name: r.name, tool_call_id: r.id });
       emit({ type: "tool_result", tool: r.name, decision: r.decision, content: r.content, turn });
+      sawToolFailure = isToolFailure(r.decision, r.content);
     } else {
       // Phase A: resolve every call in order (validation, permission, onAsk, denial effect).
       const resolved: ResolvedToolCall[] = [];
@@ -270,9 +288,25 @@ export async function runAgent(opts: RunAgentOptions): Promise<AgentResult> {
       }
       // Phase C: record + emit in the ORIGINAL tool_calls order.
       for (const r of resolved) {
-        record({ role: "tool", content: r.content, tool_name: r.name, tool_call_id: r.id });
+        record({ role: "tool", content: r.decision === "allow" ? wrapToolOutput(r.content) : r.content, tool_name: r.name, tool_call_id: r.id });
         emit({ type: "tool_result", tool: r.name, decision: r.decision, content: r.content, turn });
       }
+      sawToolFailure = resolved.some((r) => isToolFailure(r.decision, r.content));
+    }
+
+    // Help006: ONE bounded self-check after a DETECTED problem — a tool crash / unknown-tool (isToolFailure, which
+    // deliberately does NOT flag invalid-args denials — the Help007 repair budget owns those), OR the 2nd
+    // consecutive denial of any kind (just before the breaker). Skipped on the repeat turn (LOOP_WARNING owns that)
+    // so the two nudges never stack. Falls through, so the loop-warning + circuit-breaker checks still run this turn.
+    if (
+      opts.reflect !== false &&
+      reflectionsUsed < MAX_REFLECTIONS_PER_RUN &&
+      consecutiveRepeats !== 1 &&
+      (sawToolFailure || consecutiveDenials === MAX_CONSECUTIVE_DENIALS - 1)
+    ) {
+      record({ role: "user", content: REFLECTION_PROMPT });
+      emit({ type: "reflection", reason: sawToolFailure ? "tool_error" : "repeated_denial", turn });
+      reflectionsUsed++;
     }
 
     // On the 2nd identical tool-call turn, warn the model once so it can break out before the hard stop.
@@ -373,8 +407,9 @@ function typeOk(type: string, val: unknown): boolean {
     case "string":
       return typeof val === "string";
     case "number":
-    case "integer":
       return typeof val === "number";
+    case "integer":
+      return typeof val === "number" && Number.isInteger(val);
     case "boolean":
       return typeof val === "boolean";
     case "object":
@@ -384,4 +419,42 @@ function typeOk(type: string, val: unknown): boolean {
     default:
       return true;
   }
+}
+
+/**
+ * Help007: repair common small-model arg-type mistakes BEFORE validation — a stringified number/integer → number,
+ * a stringified boolean → boolean, per the tool's JSON-schema `properties[key].type`. Pure (returns a new object);
+ * leaves anything it can't safely coerce untouched, so validation still reports the real error.
+ */
+export function coerceArgs(schema: Record<string, unknown>, args: Record<string, unknown>): Record<string, unknown> {
+  const props = (schema.properties ?? {}) as Record<string, { type?: string }>;
+  const out: Record<string, unknown> = { ...args };
+  for (const [key, val] of Object.entries(out)) {
+    if (typeof val !== "string") continue;
+    const type = props[key]?.type;
+    if (type === "number" && val.trim() !== "" && Number.isFinite(Number(val))) {
+      out[key] = Number(val);
+    } else if (type === "integer" && val.trim() !== "" && Number.isInteger(Number(val))) {
+      out[key] = Number(val); // only coerce when the value is genuinely an integer (12.5 stays a string -> validation reports it)
+    } else if (type === "boolean" && (val === "true" || val === "false")) {
+      out[key] = val === "true";
+    }
+  }
+  return out;
+}
+
+/** Help003: wrap tool/file output so the model treats it as DATA, not instructions (prompt-injection mitigation). */
+export function wrapToolOutput(content: string): string {
+  return `<tool_output>\n${content}\n</tool_output>`;
+}
+
+/**
+ * Help006: did this resolved call end in a DETECTED failure — a tool runtime crash (`Error running …` from the
+ * dispatch wrapper) or an unknown-tool deny? Excludes invalid-args / permission denials (the Help007 repair budget
+ * and the denial counter own those). Centralised so the error-string coupling is in one place + unit-tested.
+ */
+export function isToolFailure(decision: PermissionDecision, content: string): boolean {
+  if (decision === "allow") return content.startsWith("Error running ");
+  if (decision === "deny") return content.startsWith('Error: unknown tool');
+  return false;
 }

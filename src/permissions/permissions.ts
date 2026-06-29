@@ -280,6 +280,12 @@ export class PermissionEngine {
         return { decision: "ask", reason: r.reason ?? `ask required by rule for ${r.tool}` };
       }
     }
+    // 4a. A read that targets an OBVIOUS credential file (id_rsa, .env, .aws/credentials, …) is flagged for
+    // confirmation BEFORE any read-only auto-allow below — a silent secret read should never just happen.
+    // (Deny floor still wins; bypass already returned above; an explicit allow rule still takes precedence.)
+    if (looksLikeCredentialPath(req)) {
+      return { decision: "ask", reason: "potential credential file — confirm before reading" };
+    }
     // 5. defaults by read-only + mode.
     // A safe read-only shell command behaves like a read-only tool — bash is the universal
     // exploration tool, so `ls`/`find`/`ps`/etc. run without asking. Stays after the deny floor
@@ -331,4 +337,24 @@ export function requestFromTool(
   args: Record<string, unknown>,
 ): PermissionRequest {
   return { toolName: tool.name, args, readOnly: tool.readOnly };
+}
+
+/**
+ * Help005: does this request read an OBVIOUS credential file? Checks the read_file/grep `path` arg AND a bash/
+ * powershell `command` for well-known secret markers (SSH keys, .env, cloud/credential files). Deliberately
+ * CONSERVATIVE — specific file markers, not generic words — so false positives are near zero; a match only causes
+ * an extra confirmation prompt (fail-safe), never a block. Containment remains the real boundary.
+ */
+export function looksLikeCredentialPath(req: PermissionRequest): boolean {
+  const path = typeof req.args.path === "string" ? req.args.path : "";
+  const command = typeof req.args.command === "string" ? req.args.command : "";
+  const hay = `${path}\n${command}`.toLowerCase().replace(/\\/g, "/");
+  if (/\b(?:id_rsa|id_ed25519|id_dsa|id_ecdsa)\b/.test(hay)) return true; // SSH private keys
+  if (/\.(?:pem|ppk)\b/.test(hay)) return true; // cert / private keys
+  if (/(?:^|\/)\.(?:ssh|aws|gnupg)(?:\/|$)/.test(hay)) return true; // ~/.ssh ~/.aws ~/.gnupg dirs
+  if (/(?:^|\/)\.(?:npmrc|netrc|pgpass)\b/.test(hay)) return true; // token/credential dotfiles
+  if (/(?:^|\/)\.kube\/config\b/.test(hay)) return true; // kubeconfig
+  // .env and variants (NOT the safe .env.example / .sample / .template / .dist)
+  if (/(?:^|\/)\.env(?:\.[a-z]+)?\b/.test(hay) && !/\.env\.(?:example|sample|template|dist)\b/.test(hay)) return true;
+  return false;
 }

@@ -3,7 +3,7 @@
   "//connections": "OPTIONAL named API/account blocks. A model picks one via its 'connection' field. Define the SAME api type under several names (with different apiKeyEnv) to use multiple accounts. Names must be unique — a duplicate resolves to the LAST. A model with no 'connection' uses 'local'.",
   "connections": {
     "local": { "type": "ollama", "baseUrl": "http://127.0.0.1:11434" },
-    "remote-ollama": { "type": "compat", "baseUrl": "https://api.groq.com/openai/v1", "apiKeyEnv": "GROQ_API_KEY" }
+    "remote-ollama": { "type": "compat", "baseUrl": "https://api.example.com/v1", "apiKeyEnv": "GROQ_API_KEY" }
   },
   "//compat": "External /v1 (compat) providers land in the next release. Shape (for when ready): \"groq-work\": { \"type\": \"compat\", \"baseUrl\": \"https://api.example.com/v1\", \"apiKeyEnv\": \"GROQ_WORK\" } — the key itself goes in .env, only the env-var NAME goes here.",
   "models": {

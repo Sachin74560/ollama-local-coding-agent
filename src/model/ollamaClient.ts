@@ -12,6 +12,7 @@
 import { randomUUID } from "node:crypto";
 import { resolveModel, OLLAMA_BASE_URL, type ModelConfig } from "../model/config.ts";
 import { type RetryConfig, RETRY_DEFAULTS, retryWithBackoff } from "./retry.ts";
+import { looseParseObject } from "./jsonRepair.ts";
 import type { ModelClient } from "./modelClient.ts";
 
 export type Role = "system" | "user" | "assistant" | "tool";
@@ -110,12 +111,7 @@ export function buildChatRequest(opts: ChatOptions): OllamaChatBody {
 }
 
 function safeJsonObject(s: string): Record<string, unknown> {
-  try {
-    const v: unknown = JSON.parse(s);
-    return v && typeof v === "object" ? (v as Record<string, unknown>) : {};
-  } catch {
-    return {};
-  }
+  return looseParseObject(s) ?? {}; // strict-first + lenient repair for weak-model arg strings; {} if unrecoverable
 }
 
 /**

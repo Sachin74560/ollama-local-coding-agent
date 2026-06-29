@@ -108,6 +108,13 @@ test("parseChatResponse tolerates string-encoded tool arguments + missing fields
   assert.equal(r.text, "");
 });
 
+test("parseChatResponse repairs malformed string-encoded tool arguments (Help001)", () => {
+  const r = parseChatResponse({
+    message: { content: "", tool_calls: [{ function: { name: "x", arguments: "{'a':1,'b':true,}" } }] },
+  });
+  assert.deepEqual(r.toolCalls[0].function.arguments, { a: 1, b: true });
+});
+
 test("parseChatResponse captures non-function-wrapped tool calls (weak-model shapes)", () => {
   const r = parseChatResponse({
     message: { content: "", tool_calls: [{ name: "read_file", arguments: { path: "x" } }] },

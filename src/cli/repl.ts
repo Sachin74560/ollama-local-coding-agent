@@ -33,6 +33,12 @@ export function parseAskReply(input: string): "once" | "always" | "no" {
   return "no";
 }
 
+/** Parse a workspace-trust reply: y/yes → true (trust), anything else → false (fail-safe = don't trust). */
+export function parseTrustReply(input: string): boolean {
+  const s = input.trim().toLowerCase();
+  return s === "y" || s === "yes";
+}
+
 
 export async function runLines(
   lines: AsyncIterable<string>,

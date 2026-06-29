@@ -28,6 +28,25 @@ test("recovers a Hermes <tool_call> block", () => {
   assert.deepEqual(r.toolCalls[0].function.arguments, { command: "ls" });
 });
 
+test("Help001: recovers a single-quoted / trailing-comma / truncated content call", () => {
+  const single = recoverToolCallsFromContent("{'name':'read_file','arguments':{'path':'a.txt'}}", known);
+  assert.equal(single.toolCalls.length, 1);
+  assert.deepEqual(single.toolCalls[0].function.arguments, { path: "a.txt" });
+
+  const comma = recoverToolCallsFromContent('{"name":"grep","arguments":{"pattern":"foo"},}', known);
+  assert.equal(comma.toolCalls.length, 1);
+  assert.deepEqual(comma.toolCalls[0].function.arguments, { pattern: "foo" });
+
+  const truncated = recoverToolCallsFromContent('{"name":"bash","arguments":{"command":"ls"}', known); // missing final brace
+  assert.equal(truncated.toolCalls.length, 1);
+  assert.deepEqual(truncated.toolCalls[0].function.arguments, { command: "ls" });
+});
+
+test("Help001: lenient repair does NOT recover an unknown tool or mere prose (gate intact)", () => {
+  assert.equal(recoverToolCallsFromContent("{'name':'launch_missiles','arguments':{}}", known).toolCalls.length, 0);
+  assert.equal(recoverToolCallsFromContent("I could read_file the config, but won't.", known).toolCalls.length, 0);
+});
+
 test("tolerates arguments-as-string and the 'parameters' key", () => {
   const a = recoverToolCallsFromContent('{"name":"read_file","arguments":"{\\"path\\":\\"x\\"}"}', known);
   assert.deepEqual(a.toolCalls[0].function.arguments, { path: "x" });

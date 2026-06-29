@@ -11,6 +11,7 @@
 
 import { randomUUID } from "node:crypto";
 import type { ToolCall } from "../model/ollamaClient.ts";
+import { looseParseObject } from "../model/jsonRepair.ts";
 
 export interface RecoveredCalls {
   toolCalls: ToolCall[];
@@ -88,7 +89,7 @@ export function recoverToolCallsFromContent(
 }
 
 function tryParseCall(s: string, isKnownTool?: (name: string) => boolean): ToolCall | null {
-  const obj = extractJsonObject(s);
+  const obj = extractJsonObject(s) ?? looseParseObject(s); // strict first; lenient repair as a fail-safe fallback
   if (!obj) return null;
   const name =
     typeof obj.name === "string" ? obj.name : typeof obj.tool === "string" ? obj.tool : "";
@@ -137,12 +138,7 @@ export function extractJsonObject(s: string): Record<string, unknown> | null {
 }
 
 function safeParseObject(s: string): Record<string, unknown> {
-  try {
-    const v = JSON.parse(s);
-    return v && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, unknown>) : {};
-  } catch {
-    return {};
-  }
+  return looseParseObject(s) ?? {}; // strict-first + lenient repair; {} if unrecoverable
 }
 
 // ---- function-call-syntax recovery (KNOWN_TOOL(args) the model wrote as prose) ----

@@ -2,7 +2,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { interruptAction, shellGuidance, parseAskReply, runLines, isCommandLine } from "../src/cli/repl.ts";
+import { interruptAction, shellGuidance, parseAskReply, parseTrustReply, runLines, isCommandLine } from "../src/cli/repl.ts";
 
 // a tiny async-iterable of lines (stands in for piped readline input)
 async function* lines(...xs: string[]): AsyncGenerator<string> {
@@ -29,6 +29,15 @@ test("parseAskReply: y/yes → once, a/always → always, else → no", () => {
   assert.equal(parseAskReply("n"), "no");
   assert.equal(parseAskReply(""), "no");
   assert.equal(parseAskReply("nonsense"), "no");
+});
+
+test("parseTrustReply: y/yes → trust, everything else → don't trust", () => {
+  assert.equal(parseTrustReply("y"), true);
+  assert.equal(parseTrustReply("YES"), true);
+  assert.equal(parseTrustReply("n"), false);
+  assert.equal(parseTrustReply(""), false);
+  assert.equal(parseTrustReply("a"), false); // no "always" for trust — decide explicitly per new workspace
+  assert.equal(parseTrustReply("nonsense"), false);
 });
 
 test("runLines: processes EVERY line in order (no drops), trimming each", async () => {

@@ -76,6 +76,22 @@ test("parseCompatResponse: text + tool_calls (string args -> object, id kept) + 
   assert.equal(r.usage.totalTokens, 15);
 });
 
+test("parseCompatResponse: a malformed string-args tool_call is repaired (Help001)", () => {
+  const r = parseCompatResponse({
+    choices: [
+      {
+        message: {
+          role: "assistant",
+          content: "",
+          tool_calls: [{ id: "c1", type: "function", function: { name: "read_file", arguments: "{'path':'a.txt',}" } }],
+        },
+      },
+    ],
+  });
+  assert.equal(r.toolCalls.length, 1);
+  assert.deepEqual(r.toolCalls[0].function.arguments, { path: "a.txt" });
+});
+
 test("chat() POSTs /v1/chat/completions and parses the reply", async () => {
   const srv = await mockServer(() => ({ json: { choices: [{ message: { content: "pong" } }], usage: { prompt_tokens: 1, completion_tokens: 1 } } }));
   try {
